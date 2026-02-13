@@ -1,5 +1,5 @@
 """
-Клиент защищенного мессенджера - ОТЛАДОЧНАЯ ВЕРСИЯ
+Клиент защищенного мессенджера - ИСПРАВЛЕННАЯ ВЕРСИЯ
 """
 import socket
 import threading
@@ -137,7 +137,7 @@ class MessengerClient:
             self.entry.config(state='disabled')
     
     def connect_to_server(self):
-        """Подключение к серверу"""
+        """Подключение к серверу - ИСПРАВЛЕНО"""
         try:
             self.append_text("[СИСТЕМА] Подключение к серверу...", "system")
             self.debug_log("Создание сокета...")
@@ -173,14 +173,22 @@ class MessengerClient:
             self.server_pub = deserialize_key(handshake['server_key'])
             self.debug_log(f"Ключ сервера загружен, размер: {self.server_pub.size_in_bits()} бит")
             
-            # Отправляем данные клиента
+            # Отправляем данные клиента - ИСПРАВЛЕНО!
             client_data = {
                 'username': self.username,
                 'public_key': serialize_key(self.client_pub)
             }
             client_json = json.dumps(client_data)
-            self.debug_log(f"Отправка данных клиента: {len(client_json)} байт")
-            sock.sendall(client_json.encode())
+            client_bytes = client_json.encode('utf-8')
+            
+            # Сначала отправляем длину данных (4 байта)
+            data_length = len(client_bytes)
+            self.debug_log(f"Длина данных: {data_length} байт")
+            sock.sendall(data_length.to_bytes(4, 'big'))
+            
+            # Затем отправляем сами данные
+            self.debug_log(f"Отправка данных клиента: {data_length} байт")
+            sock.sendall(client_bytes)
             
             self.client_socket = sock
             self.update_status(True)
@@ -218,17 +226,19 @@ class MessengerClient:
             # Формируем сообщение
             data = {
                 'type': 'message',
-                'message': msg
+                'from': self.username,
+                'message': msg,
+                'timestamp': get_timestamp()
             }
-            data_json = json.dumps(data)
+            data_json = json.dumps(data, ensure_ascii=False)
             self.debug_log(f"JSON: {data_json}")
             
-            # Шифруем
+            # Шифруем публичным ключом сервера
             self.debug_log("Шифрование...")
             encrypted = encrypt_message(data_json, self.server_pub)
             self.debug_log(f"Зашифровано: {len(encrypted)} байт")
             
-            # Подписываем
+            # Подписываем своим приватным ключом
             self.debug_log("Подписание...")
             signature = sign_message(data_json, self.client_priv)
             self.debug_log(f"Подпись: {len(signature)} байт")
@@ -270,17 +280,17 @@ class MessengerClient:
                     self.debug_log(f"Подпись: {len(signature)} байт, зашифровано: {len(encrypted)} байт")
                     
                     try:
-                        # Расшифровываем
+                        # Расшифровываем своим приватным ключом
                         self.debug_log("Расшифровка...")
                         message_json = decrypt_message(encrypted, self.client_priv)
                         self.debug_log(f"Расшифровано: {message_json[:100]}...")
                         
                         message_data = json.loads(message_json)
                         
-                        # Проверяем подпись
+                        # Проверяем подпись публичным ключом сервера
                         self.debug_log("Проверка подписи...")
                         if verify_signature(message_json, signature, self.server_pub):
-                            self.debug_log("Подпись верна")
+                            self.debug_log("Подпись верна ✅")
                             msg_type = message_data.get('type', 'message')
                             
                             if msg_type == 'message':
@@ -297,7 +307,7 @@ class MessengerClient:
                                 self.append_text(f"[СИСТЕМА] {message_data.get('message', '')}", "system")
                                 write_log("CLIENT", f"Системное сообщение: {message_data.get('message', '')}", "INFO")
                         else:
-                            self.debug_log("ПОДПИСЬ НЕВЕРНА!")
+                            self.debug_log("ПОДПИСЬ НЕВЕРНА! ❌")
                             self.append_text("[ПРЕДУПРЕЖДЕНИЕ] Получено сообщение с неверной подписью", "error")
                         
                     except json.JSONDecodeError as e:
