@@ -1,5 +1,5 @@
 """
-Сервер защищенного мессенджера - ОТЛАДОЧНАЯ ВЕРСИЯ
+Сервер защищенного мессенджера - ИСПРАВЛЕННАЯ ВЕРСИЯ
 """
 import socket
 import threading
@@ -30,7 +30,7 @@ class MessengerServer:
         self.debug_mode = True
         
         print("=" * 60)
-        print("     ЗАЩИЩЕННЫЙ МЕССЕНДЖЕР - СЕРВЕР (ОТЛАДКА)")
+        print("     ЗАЩИЩЕННЫЙ МЕССЕНДЖЕР - СЕРВЕР (ИСПРАВЛЕН)")
         print("=" * 60)
         print(f"Адрес: {HOST}:{PORT}")
         print(f"Размер ключа: {self.server_pub.size_in_bits()} бит")
@@ -107,7 +107,7 @@ class MessengerServer:
                 }
             
             # Уведомление всех
-            self.broadcast(f"{username} присоединился к чату", sender_id=client_id)
+            self.broadcast(f"{username} присоединился к чату", sender_id=client_id, sender_name="Система")
             
             print(f"[✓] {username} подключился. Онлайн: {len(self.clients)}")
             
@@ -134,12 +134,15 @@ class MessengerServer:
                     self.debug_log(f"Подпись: {len(signature)} байт, зашифровано: {len(encrypted)} байт")
                     
                     try:
-                        # Расшифровываем
+                        # Расшифровываем сообщение
                         self.debug_log("Расшифровка...")
                         message_json = decrypt_message(encrypted, self.server_priv)
                         self.debug_log(f"Расшифровано: {message_json[:100]}...")
                         
                         message_data = json.loads(message_json)
+                        
+                        # Получаем ключ клиента из словаря
+                        client_pub = self.clients[client_id]['pub_key']
                         
                         # Проверяем подпись
                         self.debug_log("Проверка подписи...")
@@ -148,7 +151,7 @@ class MessengerServer:
                             self.debug_log("ПОДПИСЬ НЕВЕРНА!")
                             continue
                         
-                        self.debug_log("Подпись верна")
+                        self.debug_log("Подпись верна ✅")
                         
                         # Обрабатываем сообщение
                         msg_type = message_data.get('type', 'message')
@@ -192,7 +195,7 @@ class MessengerServer:
             self.remove_client(client_id)
     
     def register_client(self, conn):
-        """Регистрация клиента"""
+        """Регистрация клиента - ИСПРАВЛЕНО"""
         try:
             # Отправляем handshake
             handshake = {
@@ -206,17 +209,33 @@ class MessengerServer:
             
             # Получаем данные клиента
             self.debug_log("Ожидание данных клиента...")
+            
+            # Сначала получаем длину данных (4 байта)
+            data_length_bytes = conn.recv(4)
+            if len(data_length_bytes) < 4:
+                self.debug_log("Не получена длина данных")
+                return None, None
+            
+            data_length = int.from_bytes(data_length_bytes, 'big')
+            self.debug_log(f"Ожидаемая длина данных: {data_length} байт")
+            
+            # Получаем сами данные
             data = b""
-            while True:
-                chunk = conn.recv(4096)
+            while len(data) < data_length:
+                chunk = conn.recv(min(4096, data_length - len(data)))
                 if not chunk:
                     break
                 data += chunk
-                if b'\n' in chunk:
-                    break
             
-            data_str = data.decode().strip()
-            self.debug_log(f"Получены данные: {data_str[:100]}...")
+            self.debug_log(f"Получено {len(data)} байт")
+            
+            # Декодируем JSON
+            try:
+                data_str = data.decode('utf-8')
+                self.debug_log(f"Получены данные: {data_str[:100]}...")
+            except UnicodeDecodeError as e:
+                self.debug_log(f"Ошибка декодирования UTF-8: {e}")
+                return None, None
             
             if not data_str:
                 return None, None
@@ -245,6 +264,7 @@ class MessengerServer:
         try:
             welcome = {
                 'type': 'system',
+                'from': 'Сервер',
                 'message': f'Добро пожаловать, {username}!',
                 'timestamp': get_timestamp()
             }
@@ -271,6 +291,7 @@ class MessengerServer:
             user_list = ", ".join(users)
             response = {
                 'type': 'system',
+                'from': 'Сервер',
                 'message': f'Пользователи онлайн: {user_list}',
                 'timestamp': get_timestamp()
             }
@@ -306,7 +327,7 @@ class MessengerServer:
                     del self.clients[client_id]
             
             # Уведомляем остальных
-            self.broadcast(f"{username} покинул чат")
+            self.broadcast(f"{username} покинул чат", sender_name="Система")
             
             print(f"[-] {username} отключился. Онлайн: {len(self.clients)}")
     
