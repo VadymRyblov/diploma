@@ -61,3 +61,4 @@ class CRT:
         """
         # Подпись - это та же операция, что и расшифровка
         return CRT.decrypt(m, private_key)
+    
