@@ -1,5 +1,5 @@
 """
-Сервер защищенного мессенджера - ИСПРАВЛЕННАЯ ВЕРСИЯ
+Сервер защищенного мессенджера - С CRT ПОДДЕРЖКОЙ
 """
 import socket
 import threading
@@ -30,10 +30,12 @@ class MessengerServer:
         self.debug_mode = True
         
         print("=" * 60)
-        print("     ЗАЩИЩЕННЫЙ МЕССЕНДЖЕР - СЕРВЕР (ИСПРАВЛЕН)")
+        print("     ЗАЩИЩЕННЫЙ МЕССЕНДЖЕР - СЕРВЕР (CRT)")
         print("=" * 60)
         print(f"Адрес: {HOST}:{PORT}")
         print(f"Размер ключа: {self.server_pub.size_in_bits()} бит")
+        if hasattr(self.server_priv, 'p'):
+            print(f"CRT параметры: p={self.server_priv.p.bit_length()} бит, q={self.server_priv.q.bit_length()} бит")
         print("=" * 60)
         print("Ожидание подключений...")
     
@@ -134,7 +136,7 @@ class MessengerServer:
                     self.debug_log(f"Подпись: {len(signature)} байт, зашифровано: {len(encrypted)} байт")
                     
                     try:
-                        # Расшифровываем сообщение
+                        # Расшифровываем сообщение (с CRT)
                         self.debug_log("Расшифровка...")
                         message_json = decrypt_message(encrypted, self.server_priv)
                         self.debug_log(f"Расшифровано: {message_json[:100]}...")
@@ -195,7 +197,7 @@ class MessengerServer:
             self.remove_client(client_id)
     
     def register_client(self, conn):
-        """Регистрация клиента - ИСПРАВЛЕНО"""
+        """Регистрация клиента"""
         try:
             # Отправляем handshake
             handshake = {
@@ -292,7 +294,7 @@ class MessengerServer:
             response = {
                 'type': 'system',
                 'from': 'Сервер',
-                'message': f'Пользователи онлайн: {user_list}',
+                'message': f'Пользователи онлайн ({len(users)}): {user_list}',
                 'timestamp': get_timestamp()
             }
             
