@@ -162,6 +162,8 @@ class MessengerServer:
                             msg = message_data.get('message', '').strip()
                             if msg:
                                 print(f"[{get_timestamp()}] {username}: {msg}")
+                                # Добавляем запись в лог о полученном сообщении
+                                write_log("SERVER", f"Получено от {username}: {msg}", "INFO")
                                 self.debug_log(f"Пересылка сообщения '{msg}' всем...")
                                 self.broadcast(msg, sender_id=client_id, sender_name=username)
                         

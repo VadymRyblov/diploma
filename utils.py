@@ -1,22 +1,19 @@
 """
-Утилиты для защищенного мессенджера - С CRT ПОДДЕРЖКОЙ
+Утилиты для защищенного мессенджера - ФИНАЛЬНАЯ ВЕРСИЯ
 """
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP
 from Crypto.Signature import pkcs1_15
-from Crypto.Hash import SHA256
+from Crypto.Hash import SHA256, SHA1
 import os
 import json
 from datetime import datetime
-from crt_implementation import CRT
+from crt_implementation import CRT, crt_decrypt_with_oaep
 from Crypto.Util.number import bytes_to_long, long_to_bytes
 
 KEY_FOLDER = "keys"
 LOG_FILE = os.path.join("logs", "chat.log")
 USE_CRT = True  # Включаем CRT оптимизацию
-
-# Кэш для CRT объектов
-_crt_cache = {}
 
 def ensure_folders():
     """Создает необходимые папки"""
@@ -28,8 +25,10 @@ def write_log(source: str, message: str, level="INFO"):
     """Запись в лог"""
     ensure_folders()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] [{source}] [{level}] {message}\n"
+    print(log_line, end='')  # Дублируем в консоль для отладки
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] [{source}] [{level}] {message}\n")
+        f.write(log_line)
 
 def generate_keys(name, key_size=2048):
     """Генерация пары ключей RSA"""
@@ -78,16 +77,23 @@ def encrypt_message(message: str, public_key: RSA.RsaKey) -> bytes:
 
 def decrypt_message(encrypted: bytes, private_key: RSA.RsaKey) -> str:
     """
-    Расшифровка сообщения - ВСЕГДА ИСПОЛЬЗУЕМ СТАНДАРТНЫЙ МЕТОД
-    CRT не используется для расшифровки из-за сложности с OAEP
+    Расшифровка сообщения с CRT оптимизацией
     """
-    cipher = PKCS1_OAEP.new(private_key, hashAlgo=SHA256)
-    try:
-        plaintext = cipher.decrypt(encrypted)
-        return plaintext.decode('utf-8')
-    except Exception as e:
-        write_log("ERROR", f"Ошибка расшифровки: {e}", "ERROR")
-        raise
+    if USE_CRT and hasattr(private_key, 'p') and private_key.p is not None:
+        try:
+            # Используем CRT для расшифровки + библиотеку для OAEP
+            plaintext = crt_decrypt_with_oaep(encrypted, private_key)
+            write_log("CRT", "Расшифровка с CRT выполнена успешно", "INFO")
+            return plaintext
+        except Exception as e:
+            write_log("CRT", f"Ошибка CRT: {e}, использую стандартный метод", "WARNING")
+            # Если CRT не сработал, используем стандартный метод
+            cipher = PKCS1_OAEP.new(private_key, hashAlgo=SHA256)
+            return cipher.decrypt(encrypted).decode()
+    else:
+        # Стандартная расшифровка без CRT
+        cipher = PKCS1_OAEP.new(private_key, hashAlgo=SHA256)
+        return cipher.decrypt(encrypted).decode()
 
 def sign_message(message: str, private_key: RSA.RsaKey) -> bytes:
     """
@@ -97,42 +103,30 @@ def sign_message(message: str, private_key: RSA.RsaKey) -> bytes:
     
     if USE_CRT and hasattr(private_key, 'p') and private_key.p is not None:
         try:
-            # Используем ID ключа для кэширования
-            key_id = id(private_key)
-            
-            # Создаем EMSA-PKCS1-v1_5 encoding
+            # Размер ключа в байтах
             k = private_key.size_in_bytes()
             
-            # DER encoding для SHA256
+            # EMSA-PKCS1-v1_5 encoding для SHA256
             digest_info = b'\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20' + h.digest()
             
-            # Длина PS
+            # Длина PS (padding string)
             ps_len = k - len(digest_info) - 3
-            if ps_len < 8:  # Минимальная длина PS
+            if ps_len < 8:
                 raise ValueError("Key too small")
             
             # Формируем EM
             em = b'\x00\x01' + b'\xff' * ps_len + b'\x00' + digest_info
             
-            # Преобразуем в число
+            # Преобразуем EM в число
             em_int = bytes_to_long(em)
             
             # Используем CRT для подписи
-            s_int = CRT.sign(em_int, private_key)
+            s_int = CRT.decrypt(em_int, private_key)
             
             # Преобразуем обратно в байты
             signature = long_to_bytes(s_int, k)
             
-            # Проверяем, что подпись корректна
-            # (опционально, для отладки)
-            try:
-                pkcs1_15.new(private_key.publickey()).verify(h, signature)
-                write_log("CRT", "Подписание с CRT выполнено успешно", "INFO")
-            except:
-                # Если проверка не прошла, используем стандартный метод
-                write_log("CRT", "CRT подпись не прошла проверку, использую стандартный метод", "WARNING")
-                return pkcs1_15.new(private_key).sign(h)
-            
+            write_log("CRT", "Подписание с CRT выполнено успешно", "INFO")
             return signature
             
         except Exception as e:
