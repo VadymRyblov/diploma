@@ -35,6 +35,7 @@ class MessengerClient:
         self.username = None
         self.server_pub = None
         self.running = True
+        self.socket_lock = threading.Lock()
         
         # Интерфейс
         self.create_widgets()
@@ -137,7 +138,7 @@ class MessengerClient:
             self.entry.config(state='disabled')
     
     def connect_to_server(self):
-        """Подключение к серверу - ИСПРАВЛЕНО"""
+        """Подключение к серверу"""
         try:
             self.append_text("[СИСТЕМА] Подключение к серверу...", "system")
             self.debug_log("Создание сокета...")
@@ -148,6 +149,9 @@ class MessengerClient:
             self.debug_log(f"Подключение к {HOST}:{PORT}...")
             sock.connect((HOST, PORT))
             self.debug_log("Подключено к серверу")
+            
+            # Убираем таймаут для основного цикла
+            sock.settimeout(None)
             
             # Получение handshake
             self.debug_log("Ожидание handshake...")
@@ -173,7 +177,7 @@ class MessengerClient:
             self.server_pub = deserialize_key(handshake['server_key'])
             self.debug_log(f"Ключ сервера загружен, размер: {self.server_pub.size_in_bits()} бит")
             
-            # Отправляем данные клиента - ИСПРАВЛЕНО!
+            # Отправляем данные клиента
             client_data = {
                 'username': self.username,
                 'public_key': serialize_key(self.client_pub)
@@ -190,9 +194,10 @@ class MessengerClient:
             self.debug_log(f"Отправка данных клиента: {data_length} байт")
             sock.sendall(client_bytes)
             
-            self.client_socket = sock
+            with self.socket_lock:
+                self.client_socket = sock
             self.update_status(True)
-            self.append_text("[СИСТЕМА] Подключено к серверу", "system")
+            self.append_text("[СИСТЕМА] Подключено к серверу (CRT активен)", "system")
             write_log("CLIENT", f"Подключено к серверу как '{self.username}'", "INFO")
             
             # Запускаем получение сообщений
@@ -246,15 +251,21 @@ class MessengerClient:
             # Отправляем
             packet = signature + b"|||" + encrypted
             self.debug_log(f"Отправка пакета: {len(packet)} байт")
-            self.client_socket.sendall(packet)
-            self.debug_log("Отправлено")
+            
+            with self.socket_lock:
+                if self.client_socket and self.connected:
+                    self.client_socket.sendall(packet)
+                    self.debug_log("Отправлено")
+                    
+                    # Показываем у себя
+                    self.append_text(f"{self.username}: {msg}", "self")
+                    write_log("CLIENT", f"Отправлено: {msg}", "INFO")
+                else:
+                    self.debug_log("Сокет закрыт, сообщение не отправлено")
+                    return
             
             # Очищаем поле
             self.entry.delete(0, tk.END)
-            
-            # Показываем у себя
-            self.append_text(f"{self.username}: {msg}", "self")
-            write_log("CLIENT", f"Отправлено: {msg}", "INFO")
             
         except Exception as e:
             self.debug_log(f"Ошибка отправки: {e}\n{traceback.format_exc()}")
@@ -264,10 +275,32 @@ class MessengerClient:
         """Получение сообщений"""
         self.debug_log("Поток получения сообщений запущен")
         
-        while self.connected and self.running:
+        while self.running:
             try:
-                self.debug_log("Ожидание данных...")
-                data = self.client_socket.recv(4096)
+                if not self.connected:
+                    time.sleep(0.1)
+                    continue
+                
+                with self.socket_lock:
+                    if not self.client_socket or not self.connected:
+                        time.sleep(0.1)
+                        continue
+                    sock = self.client_socket
+                
+                # Устанавливаем небольшой таймаут
+                sock.settimeout(0.5)
+                
+                try:
+                    data = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                except ConnectionResetError:
+                    self.debug_log("Соединение разорвано (reset)")
+                    break
+                except Exception as e:
+                    if self.connected:
+                        self.debug_log(f"Ошибка recv: {e}")
+                    continue
                 
                 if not data:
                     self.debug_log("Сервер закрыл соединение (пустые данные)")
@@ -287,25 +320,31 @@ class MessengerClient:
                         
                         message_data = json.loads(message_json)
                         
-                        # Проверяем подпись публичным ключом сервера
+                        # Определяем тип сообщения
+                        msg_type = message_data.get('type', 'message')
+                        msg_from = message_data.get('from', 'Неизвестно')
+                        msg_text = message_data.get('message', '')
+                        msg_time = message_data.get('timestamp', '')
+                        
+                        # Для системных сообщений не проверяем подпись
+                        if msg_type == 'system':
+                            self.append_text(f"[СИСТЕМА] {msg_text}", "system")
+                            write_log("CLIENT", f"Системное сообщение: {msg_text}", "INFO")
+                            continue
+                        
+                        # ВАЖНО: Проверяем подпись ключом сервера, так как сервер подписывает все сообщения
                         self.debug_log("Проверка подписи...")
                         if verify_signature(message_json, signature, self.server_pub):
                             self.debug_log("Подпись верна ✅")
-                            msg_type = message_data.get('type', 'message')
                             
-                            if msg_type == 'message':
-                                sender = message_data.get('from', 'Неизвестно')
-                                msg = message_data.get('message', '')
-                                timestamp = message_data.get('timestamp', '')
-                                
-                                if sender != self.username:
-                                    time_str = f"[{timestamp}] " if timestamp else ""
-                                    self.append_text(f"{time_str}{sender}: {msg}", "other")
-                                    write_log("CLIENT", f"Получено от {sender}: {msg}", "INFO")
-                            
-                            elif msg_type == 'system':
-                                self.append_text(f"[СИСТЕМА] {message_data.get('message', '')}", "system")
-                                write_log("CLIENT", f"Системное сообщение: {message_data.get('message', '')}", "INFO")
+                            # Показываем сообщение, если оно не от себя
+                            if msg_from != self.username:
+                                time_str = f"[{msg_time}] " if msg_time else ""
+                                self.append_text(f"{time_str}{msg_from}: {msg_text}", "other")
+                                write_log("CLIENT", f"Получено от {msg_from}: {msg_text}", "INFO")
+                            else:
+                                # Это наше сообщение, которое вернулось от сервера - игнорируем
+                                self.debug_log("Своё сообщение от сервера - игнорируем")
                         else:
                             self.debug_log("ПОДПИСЬ НЕВЕРНА! ❌")
                             self.append_text("[ПРЕДУПРЕЖДЕНИЕ] Получено сообщение с неверной подписью", "error")
@@ -317,12 +356,6 @@ class MessengerClient:
                 else:
                     self.debug_log(f"Неверный формат: {data[:50]}...")
                     
-            except ConnectionResetError:
-                self.debug_log("Соединение разорвано (reset)")
-                break
-            except socket.timeout:
-                self.debug_log("Таймаут получения")
-                continue
             except Exception as e:
                 self.debug_log(f"Ошибка получения: {e}\n{traceback.format_exc()}")
                 if self.connected:
@@ -342,21 +375,24 @@ class MessengerClient:
     def disconnect(self):
         """Отключение"""
         self.debug_log("Отключение...")
-        if self.connected:
-            self.connected = False
-            self.running = False
-            
-            if self.client_socket:
-                try:
-                    self.client_socket.close()
-                    self.debug_log("Сокет закрыт")
-                except:
-                    pass
-                self.client_socket = None
+        
+        with self.socket_lock:
+            if self.connected:
+                self.connected = False
+                self.running = False
+                
+                if self.client_socket:
+                    try:
+                        self.client_socket.close()
+                        self.debug_log("Сокет закрыт")
+                    except:
+                        pass
+                    self.client_socket = None
             
             self.update_status(False)
-            self.append_text("[СИСТЕМА] Отключено от сервера", "system")
-            write_log("CLIENT", "Отключено от сервера", "INFO")
+        
+        self.append_text("[СИСТЕМА] Отключено от сервера", "system")
+        write_log("CLIENT", "Отключено от сервера", "INFO")
     
     def on_closing(self):
         """Закрытие окна"""
