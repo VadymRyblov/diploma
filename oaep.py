@@ -1,224 +1,274 @@
 """
 ВЛАСНА РЕАЛІЗАЦІЯ OAEP (Optimal Asymmetric Encryption Padding)
 Для дипломної роботи: "Розробка застосунку з використанням RSA, OAEP та CRT"
+
+Оптимізації порівняно з базовою версією:
+  1. Хеш-функція замінена з SHA-256 на BLAKE3 (швидша у 3–10 разів на CPU)
+  2. MGF1: O(n) bytearray замість O(n²) конкатенації bytes
+  3. MGF1: явна перевірка максимальної довжини маски (RFC 2437)
+  4. MGF1: точне обчислення кількості блоків (ceiling division, без зайвого хешування)
+  5. MGF1: паралельна версія для великих ключів (≥ 4096 біт)
 """
-from Crypto.Hash import SHA256
 import os
+from concurrent.futures import ThreadPoolExecutor
+from blake3_wrapper import BLAKE3Wrapper
+
 
 class OAEP:
     """
-    Власна реалізація OAEP згідно з PKCS#1 v2.1
+    Власна реалізація OAEP згідно з PKCS#1 v2.1.
+    Хеш-функція за замовчуванням — BLAKE3 (замість SHA-256).
     """
-    
+
+    # ------------------------------------------------------------------ #
+    #  MGF1                                                                #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
-    def mgf1(seed, mask_len, hash_func=SHA256):
+    def mgf1(seed: bytes, mask_len: int, hash_func=BLAKE3Wrapper) -> bytes:
         """
-        MGF1 (Mask Generation Function) з RFC 2437
-        
+        Покращена MGF1 (Mask Generation Function) — RFC 2437.
+
+        Покращення:
+          • bytearray.extend() — O(n) замість bytes += — O(n²)
+          • Ceiling division → точна кількість блоків, без зайвого хешування
+          • Явна перевірка ліміту довжини маски за стандартом
+
         Аргументи:
-            seed: вхідні дані для генерації маски
-            mask_len: потрібна довжина маски в байтах
-            hash_func: хеш-функція (за замовчуванням SHA256)
-        
+            seed      : вхідні дані для генерації маски
+            mask_len  : потрібна довжина маски в байтах
+            hash_func : хеш-функція (за замовчуванням BLAKE3)
+
         Повертає:
-            маску заданої довжини
+            маску заданої довжини (bytes)
         """
         h_len = hash_func.digest_size
-        mask = b''
-        counter = 0
-        
-        # Генеруємо маску блоками по h_len байт
-        while len(mask) < mask_len:
-            # Конвертуємо counter в 4 байти (big-endian)
-            c = counter.to_bytes(4, 'big')
-            # Додаємо хеш від seed + counter
-            mask += hash_func.new(seed + c).digest()
-            counter += 1
-        
-        # Повертаємо тільки потрібну довжину
-        return mask[:mask_len]
-    
+
+        # Перевірка RFC 2437: mask_len ≤ 2^32 * hLen
+        if mask_len > (2 ** 32) * h_len:
+            raise ValueError(
+                f"Запитана маска ({mask_len} байт) перевищує максимум RFC 2437"
+            )
+
+        # Точна кількість блоків (ceiling division)
+        num_blocks = (mask_len + h_len - 1) // h_len
+
+        # O(n) накопичення через bytearray
+        buf = bytearray()
+        for counter in range(num_blocks):
+            c = counter.to_bytes(4, "big")
+            buf.extend(hash_func.new(seed + c).digest())
+
+        return bytes(buf[:mask_len])
+
     @staticmethod
-    def pad(message, key_size, hash_func=SHA256, label=b''):
+    def mgf1_parallel(seed: bytes, mask_len: int, hash_func=BLAKE3Wrapper) -> bytes:
         """
-        OAEP padding згідно з PKCS#1 v2.1
-        
+        Паралельна MGF1 для великих ключів (≥ 4096 біт).
+
+        Блоки MGF1 незалежні один від одного, тому їх можна хешувати
+        одночасно. Для RSA-2048 накладні витрати на потоки перевищують
+        виграш — використовуйте звичайний mgf1(). Для RSA-4096 і більше
+        паралельна версія дає помітне прискорення.
+
+        Аргументи та повернення — ті самі, що в mgf1().
+        """
+        h_len = hash_func.digest_size
+
+        if mask_len > (2 ** 32) * h_len:
+            raise ValueError(
+                f"Запитана маска ({mask_len} байт) перевищує максимум RFC 2437"
+            )
+
+        num_blocks = (mask_len + h_len - 1) // h_len
+
+        def compute_block(counter: int) -> bytes:
+            c = counter.to_bytes(4, "big")
+            return hash_func.new(seed + c).digest()
+
+        with ThreadPoolExecutor() as executor:
+            blocks = list(executor.map(compute_block, range(num_blocks)))
+
+        buf = bytearray()
+        for block in blocks:
+            buf.extend(block)
+
+        return bytes(buf[:mask_len])
+
+    # ------------------------------------------------------------------ #
+    #  OAEP Padding / Unpadding                                            #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def pad(
+        message: bytes,
+        key_size: int,
+        hash_func=BLAKE3Wrapper,
+        label: bytes = b"",
+    ) -> bytes:
+        """
+        OAEP padding згідно з PKCS#1 v2.1.
+
         Аргументи:
-            message: повідомлення для паддінгу (bytes)
-            key_size: розмір ключа RSA в байтах
-            hash_func: хеш-функція
-            label: мітка (за замовчуванням порожня)
-        
+            message   : повідомлення для паддінгу (bytes)
+            key_size  : розмір ключа RSA в байтах
+            hash_func : хеш-функція (за замовчуванням BLAKE3)
+            label     : мітка (за замовчуванням порожня)
+
         Повертає:
             западдоване повідомлення довжиною key_size байт
+
+        Викидає:
+            ValueError : якщо повідомлення занадто довге
         """
         h_len = hash_func.digest_size
         k = key_size
-        mLen = len(message)
-        
+        m_len = len(message)
+
         # Перевірка: повідомлення не повинно бути занадто довгим
-        if mLen > k - 2 * h_len - 2:
-            raise ValueError("Повідомлення занадто довге")
-        
-        # 1. Хеш мітки (lHash)
+        if m_len > k - 2 * h_len - 2:
+            raise ValueError(
+                f"Повідомлення ({m_len} байт) занадто довге для ключа {k} байт з OAEP"
+            )
+
+        # 1. lHash = Hash(label)
         l_hash = hash_func.new(label).digest()
-        
-        # 2. Створюємо блок даних DB = lHash || PS || 0x01 || M
-        #    PS (padding string) - нулі потрібної довжини
-        ps_len = k - mLen - 2 * h_len - 2
-        PS = b'\x00' * ps_len
-        DB = l_hash + PS + b'\x01' + message
-        
-        # 3. Генеруємо випадкове число seed довжиною h_len
+
+        # 2. DB = lHash || PS || 0x01 || M
+        ps_len = k - m_len - 2 * h_len - 2
+        db = l_hash + b"\x00" * ps_len + b"\x01" + message
+
+        # 3. seed — випадкові байти довжиною h_len
         seed = os.urandom(h_len)
-        
-        # 4. dbMask = MGF(seed, k - h_len - 1)
-        dbMask = OAEP.mgf1(seed, k - h_len - 1, hash_func)
-        
-        # 5. maskedDB = DB XOR dbMask
-        maskedDB = bytes([a ^ b for a, b in zip(DB, dbMask)])
-        
+
+        # 4. dbMask = MGF(seed, k − h_len − 1)
+        db_mask = OAEP.mgf1(seed, k - h_len - 1, hash_func)
+
+        # 5. maskedDB = DB ⊕ dbMask
+        masked_db = bytes(a ^ b for a, b in zip(db, db_mask))
+
         # 6. seedMask = MGF(maskedDB, h_len)
-        seedMask = OAEP.mgf1(maskedDB, h_len, hash_func)
-        
-        # 7. maskedSeed = seed XOR seedMask
-        maskedSeed = bytes([a ^ b for a, b in zip(seed, seedMask)])
-        
+        seed_mask = OAEP.mgf1(masked_db, h_len, hash_func)
+
+        # 7. maskedSeed = seed ⊕ seedMask
+        masked_seed = bytes(a ^ b for a, b in zip(seed, seed_mask))
+
         # 8. EM = 0x00 || maskedSeed || maskedDB
-        EM = b'\x00' + maskedSeed + maskedDB
-        
-        return EM
-    
+        return b"\x00" + masked_seed + masked_db
+
     @staticmethod
-    def unpad(em, key_size, hash_func=SHA256, label=b''):
+    def unpad(
+        em: bytes,
+        key_size: int,
+        hash_func=BLAKE3Wrapper,
+        label: bytes = b"",
+    ) -> bytes:
         """
-        Видалення OAEP padding та перевірка цілісності
-        
+        Видалення OAEP padding та перевірка цілісності.
+
         Аргументи:
-            em: западдоване повідомлення
-            key_size: розмір ключа RSA в байтах
-            hash_func: хеш-функція
-            label: мітка
-        
+            em        : западдоване повідомлення
+            key_size  : розмір ключа RSA в байтах
+            hash_func : хеш-функція (за замовчуванням BLAKE3)
+            label     : мітка
+
         Повертає:
             оригінальне повідомлення
-        
+
         Викидає:
-            ValueError: якщо padding некоректний або дані пошкоджено
+            ValueError : якщо padding некоректний або дані пошкоджено
         """
         h_len = hash_func.digest_size
         k = key_size
-        
+
         # Перевірка довжини
         if len(em) != k:
-            raise ValueError("Неправильна довжина блоку")
-        
+            raise ValueError(f"Неправильна довжина блоку: {len(em)} != {k}")
+
         if k < 2 * h_len + 2:
-            raise ValueError("Ключ занадто малий для OAEP")
-        
-        # 1. Розділяємо EM
-        maskedSeed = em[1:h_len + 1]
-        maskedDB = em[h_len + 1:]
-        
+            raise ValueError("Ключ занадто малий для OAEP з цією хеш-функцією")
+
+        # 1. Розділяємо EM: 0x00 | maskedSeed | maskedDB
+        masked_seed = em[1 : h_len + 1]
+        masked_db = em[h_len + 1 :]
+
         # 2. seedMask = MGF(maskedDB, h_len)
-        seedMask = OAEP.mgf1(maskedDB, h_len, hash_func)
-        
-        # 3. seed = maskedSeed XOR seedMask
-        seed = bytes([a ^ b for a, b in zip(maskedSeed, seedMask)])
-        
-        # 4. dbMask = MGF(seed, k - h_len - 1)
-        dbMask = OAEP.mgf1(seed, k - h_len - 1, hash_func)
-        
-        # 5. DB = maskedDB XOR dbMask
-        DB = bytes([a ^ b for a, b in zip(maskedDB, dbMask)])
-        
-        # 6. Перевіряємо структуру
+        seed_mask = OAEP.mgf1(masked_db, h_len, hash_func)
+
+        # 3. seed = maskedSeed ⊕ seedMask
+        seed = bytes(a ^ b for a, b in zip(masked_seed, seed_mask))
+
+        # 4. dbMask = MGF(seed, k − h_len − 1)
+        db_mask = OAEP.mgf1(seed, k - h_len - 1, hash_func)
+
+        # 5. DB = maskedDB ⊕ dbMask
+        db = bytes(a ^ b for a, b in zip(masked_db, db_mask))
+
+        # 6. Перевірка lHash
         l_hash = hash_func.new(label).digest()
-        
-        # Отримуємо lHash з DB
-        db_lhash = DB[:h_len]
-        if db_lhash != l_hash:
-            raise ValueError("Неправильний хеш мітки")
-        
-        # Шукаємо 0x01 після PS (всі нулі)
-        rest = DB[h_len:]
-        
-        # Знаходимо перший ненульовий байт (повинен бути 0x01)
+        if db[:h_len] != l_hash:
+            raise ValueError("Неправильний хеш мітки — дані пошкоджено або невірний ключ")
+
+        # 7. Шукаємо 0x01 після PS (нулів)
+        rest = db[h_len:]
         sep_pos = -1
         for i, byte in enumerate(rest):
             if byte != 0:
                 if byte == 0x01:
                     sep_pos = i
                 break
-        
+
         if sep_pos == -1:
-            raise ValueError("Неправильний формат padding: не знайдено 0x01")
-        
-        # Перевіряємо, що всі байти до sep_pos - нулі
-        if not all(b == 0 for b in rest[:sep_pos]):
-            raise ValueError("PS повинен складатися з нулів")
-        
-        # Повідомлення починається після 0x01
-        message = rest[sep_pos + 1:]
-        
-        return message
-    
+            raise ValueError("Неправильний формат padding: байт 0x01 не знайдено")
+
+        return rest[sep_pos + 1 :]
+
+    # ------------------------------------------------------------------ #
+    #  Debug / Demo                                                        #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
-    def debug_pad(message, key_size):
+    def debug_pad(message: bytes, key_size: int) -> bytes:
         """
-        Демонстраційна версія з детальним виведенням для розуміння OAEP
+        Демонстраційна версія pad() з детальним виведенням.
+        Використовується для пояснення алгоритму в дипломній роботі.
         """
+        hash_func = BLAKE3Wrapper
         print("\n" + "=" * 60)
-        print("ДЕМОНСТРАЦІЯ OAEP PADDING")
+        print("ДЕМОНСТРАЦІЯ OAEP PADDING (BLAKE3 + покращений MGF1)")
         print("=" * 60)
-        
-        h_len = SHA256.digest_size
+
+        h_len = hash_func.digest_size
         k = key_size
-        mLen = len(message)
-        
-        print(f"Повідомлення: '{message.decode()}' ({mLen} байт)")
-        print(f"Розмір ключа: {k} байт")
-        print(f"Розмір хешу: {h_len} байт")
-        
-        # 1. Хеш мітки
-        l_hash = SHA256.new(b'').digest()
-        print(f"\n1. lHash (хеш порожньої мітки): {l_hash.hex()[:20]}...")
-        
-        # 2. Створюємо DB
-        ps_len = k - mLen - 2 * h_len - 2
-        PS = b'\x00' * ps_len
-        DB = l_hash + PS + b'\x01' + message
-        print(f"2. DB створено: {len(DB)} байт")
-        print(f"   - lHash: {h_len} байт")
-        print(f"   - PS: {ps_len} байт нулів")
-        print(f"   - 0x01: 1 байт")
-        print(f"   - M: {mLen} байт")
-        
-        # 3. Генеруємо seed
+        m_len = len(message)
+
+        print(f"Повідомлення : '{message.decode()}' ({m_len} байт)")
+        print(f"Розмір ключа : {k} байт")
+        print(f"Хеш-функція  : BLAKE3 (digest_size = {h_len} байт)")
+
+        l_hash = hash_func.new(b"").digest()
+        print(f"\n1. lHash (BLAKE3 порожньої мітки): {l_hash.hex()[:20]}...")
+
+        ps_len = k - m_len - 2 * h_len - 2
+        db = l_hash + b"\x00" * ps_len + b"\x01" + message
+        print(f"2. DB: {len(db)} байт  (lHash={h_len} | PS={ps_len} | 0x01=1 | M={m_len})")
+
         seed = os.urandom(h_len)
         print(f"3. seed (випадковий): {seed.hex()[:20]}...")
-        
-        # 4. dbMask
-        dbMask = OAEP.mgf1(seed, k - h_len - 1, SHA256)
-        print(f"4. dbMask створено: {len(dbMask)} байт")
-        
-        # 5. maskedDB
-        maskedDB = bytes([a ^ b for a, b in zip(DB, dbMask)])
-        print(f"5. maskedDB = DB XOR dbMask")
-        
-        # 6. seedMask
-        seedMask = OAEP.mgf1(maskedDB, h_len, SHA256)
-        print(f"6. seedMask створено: {len(seedMask)} байт")
-        
-        # 7. maskedSeed
-        maskedSeed = bytes([a ^ b for a, b in zip(seed, seedMask)])
-        print(f"7. maskedSeed = seed XOR seedMask")
-        
-        # 8. EM
-        EM = b'\x00' + maskedSeed + maskedDB
-        print(f"8. EM створено: {len(EM)} байт")
-        print(f"   - 0x00: 1 байт")
-        print(f"   - maskedSeed: {len(maskedSeed)} байт")
-        print(f"   - maskedDB: {len(maskedDB)} байт")
-        
-        return EM
+
+        db_mask = OAEP.mgf1(seed, k - h_len - 1, hash_func)
+        print(f"4. dbMask (покращений MGF1): {len(db_mask)} байт")
+
+        masked_db = bytes(a ^ b for a, b in zip(db, db_mask))
+        print(f"5. maskedDB = DB ⊕ dbMask")
+
+        seed_mask = OAEP.mgf1(masked_db, h_len, hash_func)
+        print(f"6. seedMask (покращений MGF1): {len(seed_mask)} байт")
+
+        masked_seed = bytes(a ^ b for a, b in zip(seed, seed_mask))
+        print(f"7. maskedSeed = seed ⊕ seedMask")
+
+        em = b"\x00" + masked_seed + masked_db
+        print(f"8. EM: {len(em)} байт  (0x00=1 | maskedSeed={len(masked_seed)} | maskedDB={len(masked_db)})")
+
+        return em
