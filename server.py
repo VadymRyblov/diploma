@@ -230,7 +230,7 @@ class MessengerServer:
                 f"(OAEP: власна реалізація BLAKE3 | CRT: бібліотечний)",
             )
         except Exception as e:
-            print(f"[!] Помилка привітання: {e}")
+            pass
 
     def send_user_list(self, conn: socket.socket, client_pub):
         try:
